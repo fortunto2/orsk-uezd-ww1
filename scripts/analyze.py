@@ -20,6 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "data" / "pmv-orsk-uezd-1914-1918.csv"
+if len(sys.argv) > 1 and sys.argv[1].endswith(".csv"):
+    SRC = Path(sys.argv[1])       # свод версии 2 передаётся аргументом
 OUT = ROOT / "derived"
 
 # Приставки, которые в источнике то есть, то нет: «Верхне-Бикберд» и «Бикбердина»
