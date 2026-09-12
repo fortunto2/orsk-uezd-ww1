@@ -109,7 +109,7 @@ def cluster(names, counts, threshold=0.84):
 
 def write(path, header, rows):
     with io.open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(header)
         w.writerows(rows)
     print(f"  {path.relative_to(ROOT)} — {len(rows)} строк")
