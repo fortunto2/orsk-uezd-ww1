@@ -60,6 +60,63 @@ def skeleton(name):
     return s
 
 
+def jaro_winkler(a, b, prefix_weight=0.1):
+    """Мера Джаро—Винклера. Своя, чтобы датасет пересобирался без зависимостей.
+
+    Почему она, а не difflib: бенчмарк на эталонной выборке (см.
+    derived/benchmark.md) даёт полноту 0,506 против 0,284 при той же доле
+    ложных склеек. Винклеровская добавка премирует совпадающее начало слова —
+    а писарь путал прежде всего середину и хвост: «Бикбердина» / «Бикбирды».
+
+    Сверено с rapidfuzz.distance.JaroWinkler на всех парах эталона:
+    максимальное расхождение 1e-9 (scripts/benchmark.py --selftest).
+    """
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    window = max(len(a), len(b)) // 2 - 1
+    if window < 0:
+        window = 0
+    a_hit, b_hit = [False] * len(a), [False] * len(b)
+    matches = 0
+    for i, ch in enumerate(a):
+        for j in range(max(0, i - window), min(len(b), i + window + 1)):
+            if not b_hit[j] and b[j] == ch:
+                a_hit[i] = b_hit[j] = True
+                matches += 1
+                break
+    if not matches:
+        return 0.0
+    k = transpositions = 0
+    for i, ch in enumerate(a):
+        if not a_hit[i]:
+            continue
+        while not b_hit[k]:
+            k += 1
+        if ch != b[k]:
+            transpositions += 1
+        k += 1
+    t = transpositions / 2
+    jaro = (matches / len(a) + matches / len(b) + (matches - t) / matches) / 3
+    prefix = 0
+    for ca, cb in zip(a[:4], b[:4]):
+        if ca != cb:
+            break
+        prefix += 1
+    return jaro + prefix * prefix_weight * (1 - jaro)
+
+
+def plain(name):
+    """Написание без приставки, регистра и разделителей — без всякой фонетики.
+
+    Мера сравнивает именно такие строки: свёртки согласных на эталоне полноту
+    не подняли. Скелет остался, но только для раскладки по корзинам.
+    """
+    s = strip_prefix(name)[1].lower().replace("ё", "е")
+    return re.sub(r"[ъь\s\-\.\,]", "", s)
+
+
 def block_key(sk):
     """Ключ блокировки: согласный костяк первых слогов.
 
@@ -70,7 +127,7 @@ def block_key(sk):
     return "".join(cons[:3]) or sk[:3]
 
 
-def cluster(names, counts, threshold=0.84):
+def cluster(names, counts, threshold=0.96, measure="both"):
     """Собираем написания в гнёзда вокруг самого частого («лидера»).
 
     Сначала было объединение по цепочке: A похоже на B, B на C — значит все
@@ -80,11 +137,46 @@ def cluster(names, counts, threshold=0.84):
     сходство с ним выписывается в таблицу — читатель может отсеять слабые
     сам, не веря порогу на слово.
 
-    Порог 0.84 подобран по ручной проверке: ниже склеиваются разные сёла,
-    выше рассыпается «Бикбердина / Бикбирды».
+    Порог 0,95 выбран не на глаз, а по эталонной выборке: это наибольшая
+    полнота среди порогов, удерживающих долю ложных склеек среди трудных
+    отрицательных пар ниже 10 % (derived/benchmark.md).
+
+    Мер две, и это не лень, а следствие того, что измерено:
+
+      measure="both"     Максимум из двух взглядов: Джаро—Винклер по
+                         написанию без фонетики видит общее начало
+                         («Бикбердина» / «Бикберды»), difflib по скелету видит
+                         звучание («Бикбау» / «Пикбау»). Для ТОПОНИМОВ. На
+                         эталоне полнота 0,370 против 0,284 у старой меры.
+                         Чистый Джаро—Винклер даёт формально больше (0,407),
+                         но эталон смещён против фонетики по построению —
+                         положительные пары в нём взяты из привязки, которая
+                         сравнивает написания БЕЗ свёрток, — и на известном
+                         примере гнездо нашей деревни при нём распадалось с
+                         шести написаний до трёх. Здесь число проиграло
+                         разобранному случаю сознательно, и это записано,
+                         чтобы следующий читатель не «исправил» обратно.
+      measure="skeleton" difflib по фонетическому скелету, порог 0,86. Для
+                         ФАМИЛИЙ, потому что эталона для них нет: справочник
+                         существует только для селений. Перенос топонимной
+                         меры сюда вслепую разваливает известные гнёзда — с
+                         Джаро—Винклером фамилия, записанная в своде девятью
+                         способами, собирается в двойку: варианты расходятся
+                         в первом слоге, который эта мера премирует сильнее
+                         всего.
+
+                         Порог 0,86 подобран не эталоном, а глазами: снижение
+                         с 0,88 добавляет 17 гнёзд, из них 14 бесспорных
+                         («Севастьянов / Севостьянов», «Казырбаков /
+                         Кызырбаков / Козырбаков») и 3 сомнительных
+                         («Муртазин / Муратшин», «Бородулин / Бородин»,
+                         «Абдрашитов / Абдрашимов»). Одна ошибка на шесть
+                         гнёзд — цена, приемлемая для словаря-подсказки, но
+                         это оценка вручную, а не измерение.
     """
     order = sorted(names, key=lambda n: (-counts[n], -len(n), n))
     skel = {n: skeleton(strip_prefix(n)[1]) for n in names}
+    flat = {n: plain(n) for n in names}
     buckets = defaultdict(list)
     for n in names:
         buckets[block_key(skel[n])].append(n)
@@ -98,8 +190,13 @@ def cluster(names, counts, threshold=0.84):
         for cand in buckets[block_key(skel[leader])]:
             if cand in taken:
                 continue
-            ratio = (1.0 if skel[cand] == skel[leader]
-                     else SequenceMatcher(None, skel[leader], skel[cand]).ratio())
+            if flat[cand] == flat[leader] or skel[cand] == skel[leader]:
+                ratio = 1.0
+            elif measure == "skeleton":
+                ratio = SequenceMatcher(None, skel[leader], skel[cand]).ratio()
+            else:
+                ratio = max(jaro_winkler(flat[leader], flat[cand]),
+                            SequenceMatcher(None, skel[leader], skel[cand]).ratio())
             if ratio >= threshold:
                 taken.add(cand)
                 members.append((cand, ratio))
@@ -172,7 +269,9 @@ def main():
     # --- 3. Гнёзда фамилий --------------------------------------------------
     surnames = [r["фамилия"].strip() for r in rows if r["фамилия"].strip()]
     scount = Counter(surnames)
-    sgroups = cluster(set(surnames), scount, threshold=0.88)
+    # ⚠️ Фамилии кластеризуются СТАРОЙ мерой и старым порогом: эталона для
+    # них нет, а перенос топонимной меры вслепую разваливает известные гнёзда.
+    sgroups = cluster(set(surnames), scount, threshold=0.86, measure="skeleton")
     srows = []
     for head, members in sgroups.items():
         if len(members) < 2:
