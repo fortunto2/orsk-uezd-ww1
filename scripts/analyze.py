@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "data" / "pmv-orsk-uezd-1914-1918.csv"
 if len(sys.argv) > 1 and sys.argv[1].endswith(".csv"):
     SRC = Path(sys.argv[1])       # свод версии 2 передаётся аргументом
-OUT = ROOT / "derived"
+OUT = ROOT / "derived" / ("v2" if "-v2" in SRC.name else "")   # v2 не затирает таблицы версии 1
+OUT.mkdir(exist_ok=True)
 
 # Приставки, которые в источнике то есть, то нет: «Верхне-Бикберд» и «Бикбердина»
 # — одно гнездо названий. Приставку отрезаем для сравнения, но СОХРАНЯЕМ в
@@ -255,8 +256,9 @@ def main():
         if not p:
             continue
         by_place[where[p]][r["причина_выбытия"] or "не указано"] += 1
-        if r["волость"]:
-            vol[where[p]][r["волость"]] += 1
+        v = r.get("волость_норм") or r["волость"]   # в v2 есть нормализованная волость
+        if v:
+            vol[where[p]][v] += 1
     place_rows = []
     for head, c in sorted(by_place.items(), key=lambda kv: -sum(kv[1].values())):
         v = vol[head].most_common(1)
@@ -305,10 +307,10 @@ def main():
 
     # --- 6. График по месяцам, SVG без библиотек ----------------------------
     svg_monthly(mrows, OUT / "monthly.svg")
-    print(f"  derived/monthly.svg")
+    print(f"  {OUT.relative_to(ROOT)}/monthly.svg")
 
     summary(rows, groups, pcount, nest_rows, srows, mrows, units)
-    print(f"  derived/summary.md")
+    print(f"  {OUT.relative_to(ROOT)}/summary.md")
 
 
 def svg_monthly(mrows, path):

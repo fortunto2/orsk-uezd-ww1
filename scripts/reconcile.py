@@ -34,7 +34,7 @@ import math
 
 ROOT = Path(__file__).resolve().parent.parent
 REF = ROOT / "reference" / "gazetteer.csv"
-OUT = ROOT / "derived" / "places-geo.csv"
+OUT = ROOT / "derived" / ("v2" if "-v2" in SRC.name else "") / "places-geo.csv"
 FUZZY_MIN = 0.84
 # Радиус, в котором одноимённое село считается тем же самым. Волость — это
 # два-три десятка вёрст; всё, что дальше, скорее тёзка. Проверено на своих:
