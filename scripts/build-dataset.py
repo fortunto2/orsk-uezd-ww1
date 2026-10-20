@@ -43,20 +43,45 @@ COLS = [
 ]
 
 
-def village(src):
-    """Населённый пункт из полного места рождения: последний сегмент с типом.
+PREFIXES = ("д. ", "с. ", "дер. ", "н.п. ", "х. ", "пос. ", "село ", "деревня ")
 
-    Портал отдаёт birth_place строкой «губ., уезд, вол., д. Имя». Отдельного
-    поля с деревней нет, а именно оно нужно чаще всего.
+
+def place_parts(src):
+    """Губерния, уезд, волость и деревня из места рождения.
+
+    ⚠️ Портал отдаёт место ДВУМЯ несовместимыми способами: либо строкой
+    birth_place «губ., уезд, вол., д. Имя», либо разложенным по полям
+    birth_place_gubernia / _uezd / _volost. Когда заполнено одно, другое
+    пусто. Первая версия сборки брала деревню из строки, а волость из поля —
+    и получила 10 784 записи с деревней, из которых **ни одна** не имела
+    волости. Разбирать надо строку, а поля использовать как запасные.
     """
     bp = (src.get("birth_place") or "").strip()
-    if not bp:
+    gub = src.get("birth_place_gubernia") or ""
+    uezd = src.get("birth_place_uezd") or ""
+    vol = src.get("birth_place_volost") or ""
+    vill = ""
+    if bp:
+        for seg in [x.strip() for x in bp.split(",")]:
+            low = seg.lower()
+            if "губ." in low:
+                gub = gub or seg
+            elif "уезд" in low:
+                uezd = uezd or seg
+            elif "вол." in low or "волост" in low:
+                vol = vol or seg
+            elif seg.startswith(PREFIXES) or (seg and not any(
+                    w in low for w in ("губ", "уезд", "вол", "обл"))):
+                vill = seg
+    return gub, uezd, vol, village_name(vill)
+
+
+def village_name(tail):
+    if not tail:
         return ""
-    tail = bp.split(",")[-1].strip()
-    for pref in ("д. ", "с. ", "дер. ", "н.п. ", "х. ", "пос. ", "село ", "деревня "):
+    for pref in PREFIXES:
         if tail.startswith(pref):
             return tail[len(pref):].strip()
-    # последний сегмент может быть губернией или волостью — тогда деревни нет
     if any(w in tail.lower() for w in ("губ.", "уезд", "вол.")):
         return ""
     return tail
@@ -90,7 +115,8 @@ def main(patterns):
                 v = s.get(key)
                 r[name] = "" if v is None else str(v)
         r["дата_события"] = (s.get("event_date_from") or s.get("vibitie_date_from") or "")[:10]
-        r["населённый_пункт"] = village(s)
+        gub, uezd, vol, vill = place_parts(s)
+        r["губерния"], r["уезд"], r["волость"], r["населённый_пункт"] = gub, uezd, vol, vill
         r["ссылка_на_карточку"] = card
         r["ссылка_на_документ"] = doc
         out.append(r)

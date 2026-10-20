@@ -27,10 +27,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze import SRC, block_key, skeleton, strip_prefix, cluster  # noqa: E402
 
+if len(sys.argv) > 1 and sys.argv[1].endswith(".csv"):
+    SRC = Path(sys.argv[1])
+
+import math
+
 ROOT = Path(__file__).resolve().parent.parent
 REF = ROOT / "reference" / "gazetteer.csv"
 OUT = ROOT / "derived" / "places-geo.csv"
 FUZZY_MIN = 0.84
+# Радиус, в котором одноимённое село считается тем же самым. Волость — это
+# два-три десятка вёрст; всё, что дальше, скорее тёзка. Проверено на своих:
+# «Бикбердина-Идяш» привязывалась к Идяшу в 60 км, «Куватова» — к Куватово в
+# 75 км, хотя оба выселка стоят вплотную к Бикбердино.
+SAME_PLACE_KM = 35
 
 
 # Приставка — часть имени, а не украшение: «Ново-Михайловский» и «Михайловка»
@@ -76,6 +86,63 @@ def load_reference():
     return rows, strict, fuzzy
 
 
+def km(lat1, lon1, lat2, lon2):
+    return 111 * math.hypot(lat1 - lat2, (lon1 - lon2) * math.cos(math.radians(lat1)))
+
+
+def anchor(rows, volost):
+    """Где примерно стоит эта волость — по уже привязанным её же селениям.
+
+    Одно название носят десятки деревень губернии, и сходство строк их не
+    различает в принципе. Различает география: если волость уже привязана
+    к нескольким точкам, новое селение той же волости должно лежать рядом.
+    """
+    pts = [(float(r["широта"]), float(r["долгота"])) for r in rows
+           if r.get("волость") == volost and r.get("широта")]
+    if len(pts) < 3:
+        return None
+    lat = sorted(p[0] for p in pts)[len(pts) // 2]
+    lon = sorted(p[1] for p in pts)[len(pts) // 2]
+    return lat, lon
+
+
+def resolve(variant, strict, fuzzy, anchors, vol_of):
+    """Привязать одно написание. Возвращает (статус, мера, объект, поле)."""
+    rank = {"city": 0, "town": 1, "village": 2, "hamlet": 3,
+            "isolated_dwelling": 4, "locality": 5}
+    a = anchors.get(vol_of.get(variant))
+    hit = strict.get(norm_strict(variant))
+    if hit:
+        if a and len(hit) > 1:
+            # Сначала география, потом размер: одноимённых сёл в губернии
+            # десятки, и ближайшее к своей волости почти всегда нужное.
+            r, nm, field = min(hit, key=lambda h: (
+                km(a[0], a[1], float(h[0]["широта"]), float(h[0]["долгота"])),
+                rank.get(h[0]["тип"], 9)))
+        else:
+            r, nm, field = min(hit, key=lambda h: rank.get(h[0]["тип"], 9))
+        if a:
+            d = km(a[0], a[1], float(r["широта"]), float(r["долгота"]))
+            if d > SAME_PLACE_KM:
+                return "далеко", f"{d:.0f} км", r, field
+        return "строгое", "1.00", r, field
+    sk = skeleton(strip_prefix(variant)[1])
+    best, best_r, best_f = None, 0.0, "имя"
+    for r, nm, field in fuzzy.get(block_key(sk), []):
+        ratio = SequenceMatcher(None, sk, skeleton(strip_prefix(nm)[1])).ratio()
+        if ratio < FUZZY_MIN:
+            continue
+        if a:
+            d = km(a[0], a[1], float(r["широта"]), float(r["долгота"]))
+            if d > SAME_PLACE_KM:
+                continue
+        if ratio > best_r:
+            best, best_r, best_f = r, ratio, field
+    if best:
+        return "нечёткое", f"{best_r:.2f}", best, best_f
+    return "нет", "", None, ""
+
+
 def main():
     if not REF.exists():
         sys.exit("Нет reference/gazetteer.csv — сначала scripts/gazetteer.py")
@@ -86,38 +153,44 @@ def main():
     ref_rows, strict, fuzzy = load_reference()
     print(f"{len(ref_rows)} объектов справочника · {len(nests)} гнёзд свода\n")
 
+    vol_count = defaultdict(Counter)
+    for r in data:
+        p = r["населённый_пункт"].strip()
+        if p and r.get("волость"):
+            vol_count[p][r["волость"]] += 1
+    vol_of = {p: c.most_common(1)[0][0] for p, c in vol_count.items()}
+
+    order = [(head, v, r) for head, members in
+             sorted(nests.items(), key=lambda kv: -sum(pcount[x] for x, _ in kv[1]))
+             for v, _ in sorted(members, key=lambda m: -pcount[m[0]])
+             for r in [sum(pcount[x] for x, _ in members)]]
+
+    # Первый проход — без географии: он и даёт якоря.
+    anchors = {}
+    first = {v: resolve(v, strict, fuzzy, anchors, vol_of) for _, v, _ in order}
+    by_vol = defaultdict(list)
+    for v, (st, _, r, _) in first.items():
+        if st == "строгое" and vol_of.get(v):
+            by_vol[vol_of[v]].append((float(r["широта"]), float(r["долгота"])))
+    for vol, pts in by_vol.items():
+        if len(pts) >= 3:
+            lat = sorted(p[0] for p in pts)[len(pts) // 2]
+            lon = sorted(p[1] for p in pts)[len(pts) // 2]
+            anchors[vol] = (lat, lon)
+    print(f"  якорей волостей: {len(anchors)} (из {len(by_vol)} волостей со строгими привязками)")
+
+    # Второй проход — с географией: тёзки за пределами волости отбраковываются.
     out, stat = [], Counter()
-    for head, members in sorted(nests.items(), key=lambda kv: -sum(pcount[v] for v, _ in kv[1])):
-        recs = sum(pcount[v] for v, _ in members)
-        for variant, _ in sorted(members, key=lambda m: -pcount[m[0]]):
-            hit = strict.get(norm_strict(variant))
-            if hit:
-                # Из нескольких одноимённых сёл берём крупнейшее по типу: село
-                # вероятнее хутора, а урочище — последнее.
-                rank = {"city": 0, "town": 1, "village": 2, "hamlet": 3,
-                        "isolated_dwelling": 4, "locality": 5}
-                r, nm, field = min(hit, key=lambda h: rank.get(h[0]["тип"], 9))
-                out.append([head, variant, pcount[variant], recs, "строгое", "1.00",
-                            r["название"], r["тип"], r["широта"], r["долгота"],
-                            r["id"], r["источник"],
-                            "переименование" if field != "название" else "имя"])
-                stat["строгое"] += 1
-                continue
-            sk = skeleton(strip_prefix(variant)[1])
-            best, best_r, best_f = None, 0.0, "имя"
-            for r, nm, field in fuzzy.get(block_key(sk), []):
-                ratio = SequenceMatcher(None, sk, skeleton(strip_prefix(nm)[1])).ratio()
-                if ratio > best_r:
-                    best, best_r, best_f = r, ratio, field
-            if best and best_r >= FUZZY_MIN:
-                out.append([head, variant, pcount[variant], recs, "нечёткое", f"{best_r:.2f}",
-                            best["название"], best["тип"], best["широта"],
-                            best["долгота"], best["id"], best["источник"],
-                            "переименование" if best_f != "название" else "имя"])
-                stat["нечёткое"] += 1
-            else:
-                out.append([head, variant, pcount[variant], recs, "нет", "", "", "", "", "", "", "", ""])
-                stat["нет"] += 1
+    for head, variant, recs in order:
+        st, meas, r, field = resolve(variant, strict, fuzzy, anchors, vol_of)
+        stat[st] += 1
+        if r is None:
+            out.append([head, variant, pcount[variant], recs, "нет", "", "", "", "", "", "", "", ""])
+        else:
+            out.append([head, variant, pcount[variant], recs, st, meas,
+                        r["название"], r["тип"], r["широта"], r["долгота"],
+                        r["id"], r["источник"],
+                        "переименование" if field != "название" else "имя"])
 
     with io.open(OUT, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
@@ -128,12 +201,14 @@ def main():
 
     total = sum(stat.values())
     print(f"  {OUT.relative_to(ROOT)} — {total} написаний")
-    for k in ("строгое", "нечёткое", "нет"):
-        print(f"    {k:9} {stat[k]:4}  {stat[k]*100/total:4.1f} %")
-    # Сколько ЗАПИСЕЙ свода получили координаты — это и есть практический выход.
-    got = sum(r[2] for r in out if r[4] != "нет")
+    for k in ("строгое", "нечёткое", "далеко", "нет"):
+        print(f"    {k:9} {stat[k]:5}  {stat[k]*100/total:4.1f} %")
+    got = sum(r[2] for r in out if r[4] in ("строгое", "нечёткое"))
     print(f"\n  записей свода с координатами: {got} из {len(places)} "
           f"({got*100//len(places)} %)")
+    if stat["далеко"]:
+        print(f"  ⚠️ {stat['далеко']} написаний отброшено как тёзки за пределами "
+              f"своей волости (дальше {SAME_PLACE_KM} км от её якоря)")
 
 
 if __name__ == "__main__":
